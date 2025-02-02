@@ -1,0 +1,17 @@
+{
+  "name": "http-proxy-autossl",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "private": true,
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "description": "",
+  "dependencies": {
+    "greenlock": "^2.8.9",
+    "greenlock-store-fs": "^3.2.2"
+  }
+}
