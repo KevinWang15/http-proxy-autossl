@@ -4,6 +4,7 @@ const https = require('https');
 const fs = require('fs');
 const Greenlock = require('greenlock');
 const store = require('greenlock-store-fs');
+const { URL } = require('url'); // Import the URL class
 
 // Optional: Only needed if we have SOCKS_HOST set
 let SocksClient;
@@ -57,8 +58,8 @@ const greenlock = Greenlock.create({
     store: greenlockStore
 });
 
-// Authentication function for CONNECT requests
-function authenticateSocket(req) {
+// Authentication function for CONNECT and regular HTTP requests
+function authenticate(req) {
     const authHeader = req.headers['proxy-authorization'] || '';
     if (!authHeader) return false;
     const [authType, authValue] = authHeader.split(' ');
@@ -75,7 +76,7 @@ async function handleConnect(clientReq, clientSocket, head) {
     console.log('Headers:', clientReq.headers);
 
     // 1. Check Basic Auth
-    if (!authenticateSocket(clientReq)) {
+    if (!authenticate(clientReq)) {
         console.log('Authentication failed');
         clientSocket.write(
             'HTTP/1.1 407 Proxy Authentication Required\r\n' +
@@ -160,7 +161,7 @@ async function handleConnect(clientReq, clientSocket, head) {
             command: 'connect',
             destination: {
                 host: targetHost,
-                port
+                port: port // Use the numeric port here
             }
         });
 
@@ -198,25 +199,218 @@ async function handleConnect(clientReq, clientSocket, head) {
     }
 }
 
+
+// Handle HTTP forwarding
+async function handleRequest(clientReq, clientRes) {
+    console.log(`Proxying HTTP request to: ${clientReq.url}`);
+
+    // 1. Check Basic Auth
+    if (!authenticate(clientReq)) {
+        console.log('Authentication failed');
+        clientRes.writeHead(407, {
+            'Proxy-Authenticate': 'Basic realm="Proxy Authentication Required"',
+            'Connection': 'close'  // Important for proper handling
+        });
+        clientRes.end();
+        return;
+    }
+
+
+    // 2. Parse the URL and check whitelist
+    let url;
+    try {
+        url = new URL(clientReq.url);
+    } catch (error) {
+        console.error("Invalid URL:", clientReq.url, error);
+        clientRes.writeHead(400, { 'Connection': 'close' });
+        clientRes.end('Invalid URL');
+        return;
+    }
+
+    if (!isDomainAllowed(url.hostname)) {
+        console.log(`Domain not allowed: ${url.hostname}`);
+        clientRes.writeHead(403, { 'Connection': 'close' });
+        clientRes.end('Forbidden');
+        return;
+    }
+
+    const options = {
+        hostname: url.hostname,
+        port: url.port || 80,
+        path: url.pathname + url.search,
+        method: clientReq.method,
+        headers: {
+            ...clientReq.headers,
+            host: url.host
+        }
+    };
+
+    // Remove proxy-specific headers
+    delete options.headers['proxy-connection'];
+    delete options.headers['proxy-authorization'];
+
+    // 3. Direct or SOCKS5 forwarding
+    if (!SOCKS_HOST) {
+        console.log('No SOCKS_HOST set; using direct http.request');
+        const proxyReq = http.request(options, (proxyRes) => {
+            clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+            proxyRes.pipe(clientRes);
+        });
+
+        proxyReq.on('error', (err) => {
+            console.error('Proxy request error:', err);
+            clientRes.writeHead(500, { 'Connection': 'close' });
+            clientRes.end('Proxy request failed');
+        });
+
+        clientReq.pipe(proxyReq);
+    } else {
+        // 4. Forward via SOCKS5 (if SOCKS_HOST is set)
+        console.log(`Forwarding HTTP via SOCKS5 at ${SOCKS_HOST}:${SOCKS_PORT} -> ${url.hostname}:${url.port || 80}`);
+
+        if (!SocksClient) {
+            console.error(
+                'SOCKS_HOST is set, but the "socks" package is not installed. ' +
+                'Please install it with: npm install socks'
+            );
+            clientRes.writeHead(500, { 'Connection': 'close' });
+            clientRes.end('SOCKS proxy configured but "socks" package not installed.');
+            return;
+        }
+
+        try {
+            const destinationPort = parseInt(url.port, 10) || 80; // Ensure port is a number
+            const { socket: socksSocket } = await SocksClient.createConnection({
+                proxy: {
+                    host: SOCKS_HOST,
+                    port: SOCKS_PORT,
+                    type: 5,
+                    userId: SOCKS_USERNAME || undefined,
+                    password: SOCKS_PASSWORD || undefined
+                },
+                command: 'connect',
+                destination: {
+                    host: url.hostname,
+                    port: destinationPort  // Use numeric port
+                }
+            });
+            socksSocket.on('error', (err) => {
+                console.error("SOCKS Error in HTTP", err);
+                clientRes.writeHead(502, { 'Connection': 'close' });
+                clientRes.end('Error connecting to target via SOCKS5.');
+            });
+
+
+            // Send initial request line and headers to the SOCKS socket
+            let initialRequest = `${clientReq.method} ${url.pathname + url.search} HTTP/1.1\r\n`;
+            for (const key in options.headers) {
+                initialRequest += `${key}: ${options.headers[key]}\r\n`;
+            }
+            initialRequest += '\r\n'; // End of headers
+            socksSocket.write(initialRequest);
+
+
+            // Pipe data both ways
+            clientReq.pipe(socksSocket); // From Client, Through Proxy, to Target (via SOCKS)
+
+            // Listen for the response from the SOCKS socket
+            let responseHeaders = '';
+            let statusCode = null;
+            let headers = null;
+
+            socksSocket.on('data', (chunk) => {
+                responseHeaders += chunk.toString();
+                const headerEndIndex = responseHeaders.indexOf('\r\n\r\n');
+
+                if (statusCode === null && headerEndIndex !== -1) {
+                    const statusLine = responseHeaders.substring(0, responseHeaders.indexOf('\r\n'));
+
+                    const statusMatch = statusLine.match(/^HTTP\/1\.[01] (\d+) .*/);
+
+                    if (!statusMatch) {
+                        console.error("Invalid Status Line received", statusLine);
+                        clientRes.writeHead(502, { 'Connection': 'close' });
+                        clientRes.end();
+                        socksSocket.end();
+                        return;
+                    }
+
+                    statusCode = parseInt(statusMatch[1], 10);
+                    const rawHeaders = responseHeaders.substring(responseHeaders.indexOf('\r\n') + 2, headerEndIndex).split('\r\n');
+                    headers = {};
+
+                    for (const rawHeader of rawHeaders) {
+                        const separatorIndex = rawHeader.indexOf(':');
+                        if (separatorIndex === -1) continue;
+                        const key = rawHeader.substring(0, separatorIndex).trim().toLowerCase();
+                        const value = rawHeader.substring(separatorIndex + 1).trim();
+                        headers[key] = value;
+                    }
+                    clientRes.writeHead(statusCode, headers);
+                    const body = responseHeaders.substring(headerEndIndex + 4);
+                    if (body)
+                        clientRes.write(Buffer.from(body, 'binary')); // Write any initial body data
+                    responseHeaders = '';
+
+                } else if (statusCode !== null) {
+                    clientRes.write(chunk); // Write body data
+                }
+
+
+            });
+
+            socksSocket.on('end', () => clientRes.end());
+
+        } catch (err) {
+            console.error('Error connecting via SOCKS:', err);
+            clientRes.writeHead(502, { 'Connection': 'close' });
+            clientRes.end('Error connecting to target via SOCKS5.');
+        }
+    }
+}
+
+
+
 // Create middleware handler for ACME challenges
 const acmeMiddleware = greenlock.middleware();
 
-// HTTP server (port 80) for handling Let's Encrypt challenges
+// HTTP server (port 80) for handling Let's Encrypt challenges and HTTP proxy
 const httpServer = http.createServer((req, res) => {
     // Serve ACME challenge or a simple 200 response
     if (req.url.startsWith('/.well-known/acme-challenge/')) {
         return acmeMiddleware(req, res);
     } else {
-        res.writeHead(200);
-        res.end('HTTP Server for ACME Challenge');
+        if (req.method === 'CONNECT') {
+            // Shouldn't happen as https server listens to connect, but in case.
+            handleConnect(req, res);
+        } else if (req.url.startsWith('http://')) {
+            handleRequest(req, res);
+        }
+        else {
+            res.writeHead(200);
+            res.end('HTTP Server for ACME Challenge and Proxy');
+        }
+
     }
 });
 
 // HTTPS server setup (port 443)
 const httpsServer = https.createServer(greenlock.tlsOptions);
 
-// Only handle HTTPS CONNECT (we ignore plain HTTP here)
+// Handle HTTPS CONNECT (we ignore plain HTTP here)
 httpsServer.on('connect', handleConnect);
+
+// Handle regular HTTP requests (Proxying)
+httpsServer.on('request', (req, res) => {
+    if (!req.url.startsWith('http://')) {
+        res.writeHead(400, { 'Connection': 'close' });
+        res.end('Invalid request');
+        return;
+    }
+    handleRequest(req, res);
+
+});
+
 
 // Error handling for servers
 [httpServer, httpsServer].forEach((server) => {
@@ -227,7 +421,7 @@ httpsServer.on('connect', handleConnect);
 
 // Start servers
 httpServer.listen(80, '0.0.0.0', () => {
-    console.log(`HTTP server (ACME) running on http://${DOMAIN_NAME}:80`);
+    console.log(`HTTP server (ACME and Proxy) running on http://${DOMAIN_NAME}:80`);
 });
 
 httpsServer.listen(443, '0.0.0.0', () => {
