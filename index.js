@@ -5,10 +5,25 @@ const fs = require('fs');
 const Greenlock = require('greenlock');
 const store = require('greenlock-store-fs');
 
-// Fetch domain name from environment variable
+// Fetch environment variables
 const DOMAIN_NAME = process.env.DOMAIN_NAME || 'example.com';
 const VALID_USERNAME = process.env.USERNAME || 'user';
 const VALID_PASSWORD = process.env.PASSWORD || 'eQqIhv07Kgew';
+
+// Whitelist configuration
+const WHITELIST_DOMAINS = process.env.WHITELIST_DOMAINS
+    ? process.env.WHITELIST_DOMAINS.split(',').map(d => d.trim().toLowerCase())
+    : [];
+
+// Function to check if a domain is allowed
+function isDomainAllowed(domain) {
+    // If whitelist is empty, allow all domains
+    if (WHITELIST_DOMAINS.length === 0) {
+        return true;
+    }
+    // Otherwise, check if the requested domain is in the whitelist
+    return WHITELIST_DOMAINS.includes(domain.toLowerCase());
+}
 
 // Greenlock store initialization
 const greenlockStore = store.create({
@@ -33,9 +48,7 @@ function authenticateSocket(req) {
     if (!authHeader) return false;
     const [authType, authValue] = authHeader.split(' ');
     if (authType !== 'Basic') return false;
-    const [username, password] = Buffer.from(authValue, 'base64')
-        .toString()
-        .split(':');
+    const [username, password] = Buffer.from(authValue, 'base64').toString().split(':');
     return username === VALID_USERNAME && password === VALID_PASSWORD;
 }
 
@@ -45,10 +58,12 @@ function handleConnect(clientReq, clientSocket, head) {
 
     if (!authenticateSocket(clientReq)) {
         console.log('Authentication failed');
-        clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\n' +
+        clientSocket.write(
+            'HTTP/1.1 407 Proxy Authentication Required\r\n' +
             'Proxy-Authenticate: Basic realm="Proxy Authentication Required"\r\n' +
             'Connection: close\r\n' +
-            '\r\n');
+            '\r\n'
+        );
         clientSocket.end();
         return;
     }
@@ -57,11 +72,25 @@ function handleConnect(clientReq, clientSocket, head) {
     const [targetHost, targetPort] = clientReq.url.split(':');
     const port = parseInt(targetPort) || 443;
 
+    // Whitelist check
+    if (!isDomainAllowed(targetHost)) {
+        console.log(`Domain not allowed: ${targetHost}`);
+        clientSocket.write(
+            'HTTP/1.1 403 Forbidden\r\n' +
+            'Connection: close\r\n' +
+            '\r\n'
+        );
+        clientSocket.end();
+        return;
+    }
+
     console.log(`Connecting to ${targetHost}:${port}`);
     const targetSocket = net.connect(port, targetHost, () => {
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n' +
+        clientSocket.write(
+            'HTTP/1.1 200 Connection Established\r\n' +
             'Proxy-Agent: Node.js-Proxy\r\n' +
-            '\r\n');
+            '\r\n'
+        );
         if (head && head.length) targetSocket.write(head);
         targetSocket.pipe(clientSocket);
         clientSocket.pipe(targetSocket);
@@ -90,7 +119,23 @@ function handleConnect(clientReq, clientSocket, head) {
 function handleRequest(clientReq, clientRes) {
     console.log(`Proxying HTTP request to: ${clientReq.url}`);
 
-    const url = new URL(clientReq.url);
+    // Parse the URL to get the hostname
+    let url;
+    try {
+        url = new URL(clientReq.url);
+    } catch (error) {
+        console.error('Invalid URL:', clientReq.url);
+        clientRes.writeHead(400, {'Connection': 'close'});
+        return clientRes.end('Invalid request URL');
+    }
+
+    // Whitelist check
+    if (!isDomainAllowed(url.hostname)) {
+        console.log(`Domain not allowed: ${url.hostname}`);
+        clientRes.writeHead(403, {'Connection': 'close'});
+        return clientRes.end('Forbidden: Domain not in whitelist');
+    }
+
     const options = {
         hostname: url.hostname,
         port: url.port || 80,
@@ -149,14 +194,14 @@ httpsServer.on('request', (req, res) => {
     handleRequest(req, res);
 });
 
-// Error handling for the servers
+// Error handling for servers
 [httpServer, httpsServer].forEach(server => {
     server.on('error', (err) => {
         console.error('Server error:', err);
     });
 });
 
-// Start the servers
+// Start servers
 httpServer.listen(80, '0.0.0.0', () => {
     console.log(`HTTP server running on http://${DOMAIN_NAME}:80`);
 });
