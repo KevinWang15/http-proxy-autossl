@@ -12,6 +12,7 @@
   "description": "",
   "dependencies": {
     "greenlock": "^2.8.9",
-    "greenlock-store-fs": "^3.2.2"
+    "greenlock-store-fs": "^3.2.2",
+    "socks": "^2.8.3"
   }
 }
