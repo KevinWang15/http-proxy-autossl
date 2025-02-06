@@ -4,7 +4,7 @@ const https = require('https');
 const fs = require('fs');
 const Greenlock = require('greenlock');
 const store = require('greenlock-store-fs');
-const { URL } = require('url'); // Import the URL class
+const {URL} = require('url'); // Import the URL class
 
 // Optional: Only needed if we have SOCKS_HOST set
 let SocksClient;
@@ -37,8 +37,18 @@ function isDomainAllowed(domain) {
     if (WHITELIST_DOMAINS.length === 0) {
         return true;
     }
-    // Otherwise, check if the requested domain is in the whitelist
-    return WHITELIST_DOMAINS.includes(domain.toLowerCase());
+    // Check each whitelist entry
+    return WHITELIST_DOMAINS.some(whitelistDomain => {
+        whitelistDomain = whitelistDomain.toLowerCase();
+
+        // Check for wildcard pattern
+        if (whitelistDomain.startsWith('*.')) {
+            return domain.endsWith(whitelistDomain.slice(1)) || domain === whitelistDomain.slice(2);
+        }
+
+        // Exact match check
+        return domain === whitelistDomain;
+    });
 }
 
 // Greenlock store initialization
@@ -150,7 +160,7 @@ async function handleConnect(clientReq, clientSocket, head) {
     );
 
     try {
-        const { socket: socksSocket } = await SocksClient.createConnection({
+        const {socket: socksSocket} = await SocksClient.createConnection({
             proxy: {
                 host: SOCKS_HOST,
                 port: SOCKS_PORT,
@@ -222,14 +232,14 @@ async function handleRequest(clientReq, clientRes) {
         url = new URL(clientReq.url);
     } catch (error) {
         console.error("Invalid URL:", clientReq.url, error);
-        clientRes.writeHead(400, { 'Connection': 'close' });
+        clientRes.writeHead(400, {'Connection': 'close'});
         clientRes.end('Invalid URL');
         return;
     }
 
     if (!isDomainAllowed(url.hostname)) {
         console.log(`Domain not allowed: ${url.hostname}`);
-        clientRes.writeHead(403, { 'Connection': 'close' });
+        clientRes.writeHead(403, {'Connection': 'close'});
         clientRes.end('Forbidden');
         return;
     }
@@ -259,7 +269,7 @@ async function handleRequest(clientReq, clientRes) {
 
         proxyReq.on('error', (err) => {
             console.error('Proxy request error:', err);
-            clientRes.writeHead(500, { 'Connection': 'close' });
+            clientRes.writeHead(500, {'Connection': 'close'});
             clientRes.end('Proxy request failed');
         });
 
@@ -273,14 +283,14 @@ async function handleRequest(clientReq, clientRes) {
                 'SOCKS_HOST is set, but the "socks" package is not installed. ' +
                 'Please install it with: npm install socks'
             );
-            clientRes.writeHead(500, { 'Connection': 'close' });
+            clientRes.writeHead(500, {'Connection': 'close'});
             clientRes.end('SOCKS proxy configured but "socks" package not installed.');
             return;
         }
 
         try {
             const destinationPort = parseInt(url.port, 10) || 80; // Ensure port is a number
-            const { socket: socksSocket } = await SocksClient.createConnection({
+            const {socket: socksSocket} = await SocksClient.createConnection({
                 proxy: {
                     host: SOCKS_HOST,
                     port: SOCKS_PORT,
@@ -296,7 +306,7 @@ async function handleRequest(clientReq, clientRes) {
             });
             socksSocket.on('error', (err) => {
                 console.error("SOCKS Error in HTTP", err);
-                clientRes.writeHead(502, { 'Connection': 'close' });
+                clientRes.writeHead(502, {'Connection': 'close'});
                 clientRes.end('Error connecting to target via SOCKS5.');
             });
 
@@ -329,7 +339,7 @@ async function handleRequest(clientReq, clientRes) {
 
                     if (!statusMatch) {
                         console.error("Invalid Status Line received", statusLine);
-                        clientRes.writeHead(502, { 'Connection': 'close' });
+                        clientRes.writeHead(502, {'Connection': 'close'});
                         clientRes.end();
                         socksSocket.end();
                         return;
@@ -363,12 +373,11 @@ async function handleRequest(clientReq, clientRes) {
 
         } catch (err) {
             console.error('Error connecting via SOCKS:', err);
-            clientRes.writeHead(502, { 'Connection': 'close' });
+            clientRes.writeHead(502, {'Connection': 'close'});
             clientRes.end('Error connecting to target via SOCKS5.');
         }
     }
 }
-
 
 
 // Create middleware handler for ACME challenges
@@ -385,8 +394,7 @@ const httpServer = http.createServer((req, res) => {
             handleConnect(req, res);
         } else if (req.url.startsWith('http://')) {
             handleRequest(req, res);
-        }
-        else {
+        } else {
             res.writeHead(200);
             res.end('HTTP Server for ACME Challenge and Proxy');
         }
@@ -403,7 +411,7 @@ httpsServer.on('connect', handleConnect);
 // Handle regular HTTP requests (Proxying)
 httpsServer.on('request', (req, res) => {
     if (!req.url.startsWith('http://')) {
-        res.writeHead(400, { 'Connection': 'close' });
+        res.writeHead(400, {'Connection': 'close'});
         res.end('Invalid request');
         return;
     }
