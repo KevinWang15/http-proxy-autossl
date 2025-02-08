@@ -4,49 +4,71 @@ const https = require('https');
 const fs = require('fs');
 const Greenlock = require('greenlock');
 const store = require('greenlock-store-fs');
-const {URL} = require('url'); // Import the URL class
+const {URL} = require('url');
+const SocksClient = require('socks').SocksClient;
 
-// Optional: Only needed if we have SOCKS_HOST set
-let SocksClient;
-try {
-    SocksClient = require('socks').SocksClient;
-} catch (err) {
-    // If 'socks' isn't installed, we'll just skip it unless we need it.
-    // But normally you'd run: npm install socks
-}
 
 // Fetch environment variables
 const DOMAIN_NAME = process.env.DOMAIN_NAME || 'example.com';
-const VALID_USERNAME = process.env.USERNAME || 'user';
-const VALID_PASSWORD = process.env.PASSWORD || 'eQqIhv07Kgew';
+const CONFIG_FILE = process.env.CONFIG_FILE;
 
-// Optional SOCKS5 configuration
-const SOCKS_HOST = process.env.SOCKS_HOST || '';
-const SOCKS_PORT = parseInt(process.env.SOCKS_PORT, 10) || 1080;
-const SOCKS_USERNAME = process.env.SOCKS_USERNAME || '';
-const SOCKS_PASSWORD = process.env.SOCKS_PASSWORD || '';
+// Load profiles from config file or environment variables
+let profiles = [];
 
-// Whitelist configuration
-const WHITELIST_DOMAINS = process.env.WHITELIST_DOMAINS
-    ? process.env.WHITELIST_DOMAINS.split(',').map((d) => d.trim().toLowerCase())
-    : [];
+function loadProfiles() {
+    if (CONFIG_FILE && fs.existsSync(CONFIG_FILE)) {
+        try {
+            const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+            if (Array.isArray(config.profiles)) {
+                profiles = config.profiles.map(profile => ({
+                    ...profile,
+                    WHITELIST_DOMAINS: profile.WHITELIST_DOMAINS || []
+                }));
+                console.log(`Loaded ${profiles.length} profiles from config file`);
+            } else {
+                throw new Error('Config file must contain a profiles array');
+            }
+        } catch (err) {
+            console.error('Error loading config file:', err);
+            process.exit(1);
+        }
+    } else {
+        // Create single profile from environment variables (backwards compatibility)
+        profiles = [{
+            USERNAME: process.env.USERNAME || 'user',
+            PASSWORD: process.env.PASSWORD || 'eQqIhv07Kgew',
+            SOCKS_HOST: process.env.SOCKS_HOST || '',
+            SOCKS_PORT: parseInt(process.env.SOCKS_PORT, 10),
+            SOCKS_USERNAME: process.env.SOCKS_USERNAME || '',
+            SOCKS_PASSWORD: process.env.SOCKS_PASSWORD || '',
+            WHITELIST_DOMAINS: process.env.WHITELIST_DOMAINS
+                ? process.env.WHITELIST_DOMAINS.split(',').map(d => d.trim().toLowerCase())
+                : []
+        }];
+        console.log('Using single profile from environment variables');
+    }
+}
 
-// Function to check if a domain is allowed
-function isDomainAllowed(domain) {
-    // If whitelist is empty, allow all domains
-    if (WHITELIST_DOMAINS.length === 0) {
+loadProfiles();
+
+// Function to find matching profile for authentication
+function findMatchingProfile(username, password) {
+    return profiles.find(profile =>
+        profile.USERNAME === username && profile.PASSWORD === password
+    );
+}
+
+// Function to check if a domain is allowed for a specific profile
+function isDomainAllowed(domain, profile) {
+    if (!profile.WHITELIST_DOMAINS || profile.WHITELIST_DOMAINS.length === 0) {
         return true;
     }
-    // Check each whitelist entry
-    return WHITELIST_DOMAINS.some(whitelistDomain => {
+    return profile.WHITELIST_DOMAINS.some(whitelistDomain => {
         whitelistDomain = whitelistDomain.toLowerCase();
-
-        // Check for wildcard pattern
         if (whitelistDomain.startsWith('*.')) {
-            return domain.endsWith(whitelistDomain.slice(1)) || domain === whitelistDomain.slice(2);
+            return domain.endsWith(whitelistDomain.slice(1)) ||
+                domain === whitelistDomain.slice(2);
         }
-
-        // Exact match check
         return domain === whitelistDomain;
     });
 }
@@ -71,44 +93,40 @@ const greenlock = Greenlock.create({
 // Authentication function for CONNECT and regular HTTP requests
 function authenticate(req) {
     const authHeader = req.headers['proxy-authorization'] || '';
-    if (!authHeader) return false;
+    if (!authHeader) return null;
     const [authType, authValue] = authHeader.split(' ');
-    if (authType !== 'Basic') return false;
+    if (authType !== 'Basic') return null;
     const [username, password] = Buffer.from(authValue, 'base64')
         .toString()
         .split(':');
-    return username === VALID_USERNAME && password === VALID_PASSWORD;
+    return findMatchingProfile(username, password);
 }
 
 // Handle CONNECT requests (HTTPS)
 async function handleConnect(clientReq, clientSocket, head) {
     console.log('Received CONNECT request:', clientReq.url);
-    console.log('Headers:', clientReq.headers);
 
-    // 1. Check Basic Auth
-    if (!authenticate(clientReq)) {
+    // Check Basic Auth and get profile
+    const profile = authenticate(clientReq);
+    if (!profile) {
         console.log('Authentication failed');
         clientSocket.write(
             'HTTP/1.1 407 Proxy Authentication Required\r\n' +
             'Proxy-Authenticate: Basic realm="Proxy Authentication Required"\r\n' +
-            'Connection: close\r\n' +
-            '\r\n'
+            'Connection: close\r\n\r\n'
         );
         clientSocket.end();
         return;
     }
 
-    // 2. Parse the target from clientReq.url
     const [targetHost, targetPort] = clientReq.url.split(':');
     const port = parseInt(targetPort, 10) || 443;
 
-    // 3. Whitelist check
-    if (!isDomainAllowed(targetHost)) {
+    if (!isDomainAllowed(targetHost, profile)) {
         console.log(`Domain not allowed: ${targetHost}`);
         clientSocket.write(
             'HTTP/1.1 403 Forbidden\r\n' +
-            'Connection: close\r\n' +
-            '\r\n'
+            'Connection: close\r\n\r\n'
         );
         clientSocket.end();
         return;
@@ -116,14 +134,12 @@ async function handleConnect(clientReq, clientSocket, head) {
 
     console.log(`\nCONNECT -> ${targetHost}:${port}`);
 
-    // 4. If SOCKS_HOST is not set or empty, do a direct TCP connect
-    if (!SOCKS_HOST) {
+    if (!profile.SOCKS_HOST) {
         console.log('No SOCKS_HOST set; using direct net.connect');
         const targetSocket = net.connect(port, targetHost, () => {
             clientSocket.write(
                 'HTTP/1.1 200 Connection Established\r\n' +
-                'Proxy-Agent: Node.js-Proxy\r\n' +
-                '\r\n'
+                'Proxy-Agent: Node.js-Proxy\r\n\r\n'
             );
             if (head && head.length) targetSocket.write(head);
             targetSocket.pipe(clientSocket);
@@ -145,7 +161,6 @@ async function handleConnect(clientReq, clientSocket, head) {
         return;
     }
 
-    // 5. If SOCKS_HOST is set, forward via SOCKS5
     if (!SocksClient) {
         console.error(
             'SOCKS_HOST is set, but the "socks" package is not installed. ' +
@@ -156,41 +171,36 @@ async function handleConnect(clientReq, clientSocket, head) {
     }
 
     console.log(
-        `Forwarding via SOCKS5 at ${SOCKS_HOST}:${SOCKS_PORT} -> ${targetHost}:${port}`
+        `Forwarding via SOCKS5 at ${profile.SOCKS_HOST}:${profile.SOCKS_PORT} -> ${targetHost}:${port}`
     );
 
     try {
         const {socket: socksSocket} = await SocksClient.createConnection({
             proxy: {
-                host: SOCKS_HOST,
-                port: SOCKS_PORT,
+                host: profile.SOCKS_HOST,
+                port: profile.SOCKS_PORT,
                 type: 5,
-                userId: SOCKS_USERNAME || undefined,
-                password: SOCKS_PASSWORD || undefined
+                userId: profile.SOCKS_USERNAME || undefined,
+                password: profile.SOCKS_PASSWORD || undefined
             },
             command: 'connect',
             destination: {
                 host: targetHost,
-                port: port // Use the numeric port here
+                port: port
             }
         });
 
-        // Send 200 to client
         clientSocket.write(
             'HTTP/1.1 200 Connection Established\r\n' +
-            'Proxy-Agent: Node.js-Proxy\r\n' +
-            '\r\n'
+            'Proxy-Agent: Node.js-Proxy\r\n\r\n'
         );
-        // If there's leftover data from the client, write it to the socks socket
         if (head && head.length) {
             socksSocket.write(head);
         }
 
-        // Pipe data both ways
         socksSocket.pipe(clientSocket);
         clientSocket.pipe(socksSocket);
 
-        // Error & End events
         socksSocket.on('error', (err) => {
             console.error('SOCKS socket error:', err);
             clientSocket.end();
@@ -209,17 +219,17 @@ async function handleConnect(clientReq, clientSocket, head) {
     }
 }
 
-
 // Handle HTTP forwarding
 async function handleRequest(clientReq, clientRes) {
     console.log(`Proxying HTTP request to: ${clientReq.url}`);
 
     // 1. Check Basic Auth
-    if (!authenticate(clientReq)) {
+    const profile = authenticate(clientReq);
+    if (!profile) {
         console.log('Authentication failed');
         clientRes.writeHead(407, {
             'Proxy-Authenticate': 'Basic realm="Proxy Authentication Required"',
-            'Connection': 'close'  // Important for proper handling
+            'Connection': 'close'
         });
         clientRes.end();
         return;
@@ -237,7 +247,7 @@ async function handleRequest(clientReq, clientRes) {
         return;
     }
 
-    if (!isDomainAllowed(url.hostname)) {
+    if (!isDomainAllowed(url.hostname, profile)) {
         console.log(`Domain not allowed: ${url.hostname}`);
         clientRes.writeHead(403, {'Connection': 'close'});
         clientRes.end('Forbidden');
@@ -260,7 +270,7 @@ async function handleRequest(clientReq, clientRes) {
     delete options.headers['proxy-authorization'];
 
     // 3. Direct or SOCKS5 forwarding
-    if (!SOCKS_HOST) {
+    if (!profile.SOCKS_HOST) {
         console.log('No SOCKS_HOST set; using direct http.request');
         const proxyReq = http.request(options, (proxyRes) => {
             clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
@@ -275,8 +285,7 @@ async function handleRequest(clientReq, clientRes) {
 
         clientReq.pipe(proxyReq);
     } else {
-        // 4. Forward via SOCKS5 (if SOCKS_HOST is set)
-        console.log(`Forwarding HTTP via SOCKS5 at ${SOCKS_HOST}:${SOCKS_PORT} -> ${url.hostname}:${url.port || 80}`);
+        console.log(`Forwarding HTTP via SOCKS5 at ${profile.SOCKS_HOST}:${profile.SOCKS_PORT} -> ${url.hostname}:${url.port || 80}`);
 
         if (!SocksClient) {
             console.error(
@@ -289,19 +298,19 @@ async function handleRequest(clientReq, clientRes) {
         }
 
         try {
-            const destinationPort = parseInt(url.port, 10) || 80; // Ensure port is a number
+            const destinationPort = parseInt(url.port, 10);
             const {socket: socksSocket} = await SocksClient.createConnection({
                 proxy: {
-                    host: SOCKS_HOST,
-                    port: SOCKS_PORT,
+                    host: profile.SOCKS_HOST,
+                    port: profile.SOCKS_PORT,
                     type: 5,
-                    userId: SOCKS_USERNAME || undefined,
-                    password: SOCKS_PASSWORD || undefined
+                    userId: profile.SOCKS_USERNAME || undefined,
+                    password: profile.SOCKS_PASSWORD || undefined
                 },
                 command: 'connect',
                 destination: {
                     host: url.hostname,
-                    port: destinationPort  // Use numeric port
+                    port: destinationPort
                 }
             });
             socksSocket.on('error', (err) => {
